@@ -5,8 +5,18 @@
 # Allow only files needed by Dockerfile build steps
 !.dockerignore
 !Dockerfile
+!Dockerfile.render
+!build.gradle
+!settings.gradle
+!gradlew
+!gradle/
+!gradle/wrapper/
+!gradle/wrapper/**
+!src/
+!src/**
 !build/
 !build/libs/
 !build/libs/app.jar
+!scripts/
 !scripts/healthcheck-adaptive.sh
 !scripts/docker-entrypoint.sh

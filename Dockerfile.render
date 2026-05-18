@@ -1,0 +1,25 @@
+FROM eclipse-temurin:17-jdk AS build
+WORKDIR /workspace
+
+COPY gradlew build.gradle settings.gradle ./
+COPY gradle ./gradle
+RUN chmod +x ./gradlew
+RUN ./gradlew --no-daemon dependencies
+
+COPY src ./src
+RUN ./gradlew --no-daemon bootJar
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/healthcheck-adaptive.sh /usr/local/bin/healthcheck-adaptive.sh
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/healthcheck-adaptive.sh /usr/local/bin/docker-entrypoint.sh
+
+COPY --from=build /workspace/build/libs/app.jar /app/app.jar
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

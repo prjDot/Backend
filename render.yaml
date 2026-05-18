@@ -1,0 +1,90 @@
+services:
+  - type: web
+    name: pogun-back-sub
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: sub
+    autoDeployTrigger: commit
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    healthCheckPath: /health
+    renderSubdomainPolicy: enabled
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: SPRING_PROFILES_ACTIVE
+        value: render
+      - key: APP_SCHEMA_SYNC_ENABLED
+        value: "false"
+      - key: APP_STARTUP_WARMUP_ENABLED
+        value: "true"
+      - key: REDIS_HOST
+        fromService:
+          type: keyvalue
+          name: pogun-redis-sub
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          type: keyvalue
+          name: pogun-redis-sub
+          property: port
+      - key: DB_URL
+        sync: false
+      - key: DB_USERNAME
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: FIREBASE_KEY_BASE64
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_WEB_API_KEY
+        sync: false
+      - key: FIREBASE_WEB_APP_ID
+        sync: false
+      - key: FIREBASE_WEB_AUTH_DOMAIN
+        sync: false
+      - key: FIREBASE_WEB_MESSAGING_SENDER_ID
+        sync: false
+      - key: FIREBASE_WEB_PROJECT_ID
+        sync: false
+      - key: FIREBASE_WEB_STORAGE_BUCKET
+        sync: false
+      - key: FIREBASE_WEB_VAPID_KEY
+        sync: false
+      - key: GCLOUD_PROJECT
+        sync: false
+      - key: AWS_REGION
+        sync: false
+      - key: AWS_S3_BUCKET
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: KAKAO_JAVASCRIPT_KEY
+        sync: false
+      - key: KAKAO_LOCAL_BASE_URL
+        sync: false
+      - key: KAKAO_REST_API_KEY
+        sync: false
+      - key: SHELTER_API_SERVICE_KEY
+        sync: false
+      - key: APP_ADMIN_WEBAUTHN_ALLOWED_ORIGINS
+        sync: false
+      - key: APP_ADMIN_WEBAUTHN_RP_ID
+        sync: false
+      - key: APP_ADMIN_WEBAUTHN_RP_NAME
+        sync: false
+      - key: APP_ADMIN_WEBAUTHN_ORIGIN_RP_MAP
+        sync: false
+      - key: APP_ADMIN_VERIFY_CONTINUE_URL_MAP
+        sync: false
+      - key: APP_ADMIN_VERIFY_DEFAULT_CONTINUE_URL
+        sync: false
+
+  - type: keyvalue
+    name: pogun-redis-sub
+    plan: free
+    region: singapore
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []
