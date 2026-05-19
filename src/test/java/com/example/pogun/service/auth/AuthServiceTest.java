@@ -18,6 +18,7 @@ import com.example.pogun.service.location.KakaoLocalService;
 import com.example.pogun.service.noticechat.NoticeChatService;
 import com.example.pogun.service.user.UserPresenceService;
 import com.google.firebase.auth.FirebaseAuth;
+import com.google.firebase.auth.UserRecord;
 import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -41,6 +42,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.mock;
 
 @ExtendWith(MockitoExtension.class)
 class AuthServiceTest {
@@ -150,6 +152,38 @@ class AuthServiceTest {
     }
 
     @Test
+    void loginOrSignUp_usesAppleClaimNameWhenDisplayNameMatchesRelayAlias() throws Exception {
+        FirebaseIdentityService.FirebaseIdentity identity = new FirebaseIdentityService.FirebaseIdentity(
+                "apple-firebase-uid",
+                "a1b2c3d4e5@privaterelay.appleid.com",
+                "a1b2c3d4e5",
+                null,
+                "apple.com",
+                List.of(new FirebaseIdentityService.ProviderIdentity("apple.com", "apple-sub", "a1b2c3d4e5@privaterelay.appleid.com")),
+                java.util.Map.of(
+                        "name", "준혁 장",
+                        "given_name", "준혁",
+                        "family_name", "장"
+                )
+        );
+        when(firebaseIdentityService.verifyIdToken("apple-token")).thenReturn(identity);
+        when(userRepository.findByFirebaseUid("apple-firebase-uid")).thenReturn(Optional.empty());
+        when(userRepository.findByEmail("a1b2c3d4e5@privaterelay.appleid.com")).thenReturn(Optional.empty());
+        when(pendingSocialSignupRepository.findByFirebaseUid("apple-firebase-uid")).thenReturn(Optional.empty());
+        when(pendingSocialSignupRepository.save(any(PendingSocialSignup.class))).thenAnswer(invocation -> {
+            PendingSocialSignup pending = invocation.getArgument(0);
+            pending.setId(UUID.fromString("44444444-4444-4444-4444-444444444444"));
+            return pending;
+        });
+
+        AuthResponse response = authService.loginOrSignUp("apple-token", httpServletRequest);
+
+        assertThat(response.registrationStatus()).isEqualTo("PENDING_ONBOARDING");
+        assertThat(response.nickname()).isEqualTo("장준혁");
+        assertThat(response.provider()).isEqualTo("APPLE");
+    }
+
+    @Test
     void loginOrSignUp_unlinksEmailProviderWhenSocialProviderExists() throws Exception {
         FirebaseIdentityService.FirebaseIdentity identity = new FirebaseIdentityService.FirebaseIdentity(
                 "firebase-uid",
@@ -184,7 +218,8 @@ class AuthServiceTest {
         when(userRepository.save(any(User.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(userSocialAccountRepository.findByUserAndProvider(existing, "GOOGLE")).thenReturn(Optional.empty());
         when(userSocialAccountRepository.findByUserAndLinkedTrueOrderByCreatedAtAsc(existing))
-                .thenReturn(List.of(emailAccount), List.of());
+                .thenReturn(List.of(emailAccount))
+                .thenReturn(List.<UserSocialAccount>of());
 
         AuthResponse response = authService.loginOrSignUp("id-token", httpServletRequest);
 
@@ -193,6 +228,110 @@ class AuthServiceTest {
         assertThat(emailAccount.getLinked()).isFalse();
         verify(userSocialAccountRepository).save(emailAccount);
         verify(userSocialAccountRepository, never()).findByUserAndProvider(existing, "EMAIL");
+    }
+
+    @Test
+    void loginOrSignUp_keepsExistingHangulNicknameWhenIncomingIsFallback() throws Exception {
+        FirebaseIdentityService.FirebaseIdentity identity = new FirebaseIdentityService.FirebaseIdentity(
+                "apple-firebase-uid",
+                "apple-user@privaterelay.appleid.com",
+                "User_ab123",
+                null,
+                "apple.com",
+                List.of(new FirebaseIdentityService.ProviderIdentity("apple.com", "apple-sub", "apple-user@privaterelay.appleid.com")),
+                java.util.Map.of()
+        );
+        User existing = User.builder()
+                .id(UUID.randomUUID())
+                .firebaseUid("apple-firebase-uid")
+                .email("apple-user@privaterelay.appleid.com")
+                .nickname("장준혁")
+                .role(UserRole.USER)
+                .status(UserStatus.ACTIVE)
+                .build();
+
+        when(firebaseIdentityService.verifyIdToken("apple-token")).thenReturn(identity);
+        when(userRepository.findByFirebaseUid("apple-firebase-uid")).thenReturn(Optional.of(existing));
+        when(userRepository.save(any(User.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(userSocialAccountRepository.findByUserAndProvider(existing, "APPLE")).thenReturn(Optional.empty());
+        when(userSocialAccountRepository.findByUserAndLinkedTrueOrderByCreatedAtAsc(existing))
+                .thenReturn(List.<UserSocialAccount>of())
+                .thenReturn(List.<UserSocialAccount>of());
+
+        AuthResponse response = authService.loginOrSignUp("apple-token", httpServletRequest);
+
+        assertThat(response.nickname()).isEqualTo("장준혁");
+        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
+        verify(userRepository).save(userCaptor.capture());
+        assertThat(userCaptor.getValue().getNickname()).isEqualTo("장준혁");
+    }
+
+    @Test
+    void loginOrSignUp_keepsPendingNicknameWhenIncomingIsFallback() throws Exception {
+        FirebaseIdentityService.FirebaseIdentity identity = new FirebaseIdentityService.FirebaseIdentity(
+                "apple-pending-uid",
+                "apple-pending@privaterelay.appleid.com",
+                "User_knPnU",
+                null,
+                "apple.com",
+                List.of(new FirebaseIdentityService.ProviderIdentity("apple.com", "apple-sub", "apple-pending@privaterelay.appleid.com")),
+                java.util.Map.of()
+        );
+        PendingSocialSignup pending = PendingSocialSignup.builder()
+                .id(UUID.randomUUID())
+                .firebaseUid("apple-pending-uid")
+                .email("apple-pending@privaterelay.appleid.com")
+                .nickname("장준혁")
+                .profileImageUrl(null)
+                .provider("APPLE")
+                .linkedProviders("APPLE")
+                .expiresAt(Instant.now().plusSeconds(3600))
+                .build();
+
+        when(firebaseIdentityService.verifyIdToken("apple-token")).thenReturn(identity);
+        when(userRepository.findByFirebaseUid("apple-pending-uid")).thenReturn(Optional.empty());
+        when(userRepository.findByEmail("apple-pending@privaterelay.appleid.com")).thenReturn(Optional.empty());
+        when(pendingSocialSignupRepository.findByFirebaseUid("apple-pending-uid")).thenReturn(Optional.of(pending));
+        when(pendingSocialSignupRepository.save(any(PendingSocialSignup.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        AuthResponse response = authService.loginOrSignUp("apple-token", httpServletRequest);
+
+        assertThat(response.registrationStatus()).isEqualTo("PENDING_ONBOARDING");
+        assertThat(response.nickname()).isEqualTo("장준혁");
+        ArgumentCaptor<PendingSocialSignup> pendingCaptor = ArgumentCaptor.forClass(PendingSocialSignup.class);
+        verify(pendingSocialSignupRepository).save(pendingCaptor.capture());
+        assertThat(pendingCaptor.getValue().getNickname()).isEqualTo("장준혁");
+    }
+
+    @Test
+    void loginOrSignUp_usesFirebaseDisplayNameWhenAppleIdentityHasNoNameClaims() throws Exception {
+        FirebaseIdentityService.FirebaseIdentity identity = new FirebaseIdentityService.FirebaseIdentity(
+                "apple-no-name-uid",
+                "myagmb28s@gmail.com",
+                null,
+                null,
+                "apple.com",
+                List.of(new FirebaseIdentityService.ProviderIdentity("apple.com", "apple-sub", "myagmb28s@gmail.com")),
+                java.util.Map.of()
+        );
+        UserRecord firebaseUser = mock(UserRecord.class);
+        when(firebaseUser.getDisplayName()).thenReturn("장준혁");
+
+        when(firebaseIdentityService.verifyIdToken("apple-token")).thenReturn(identity);
+        when(firebaseAuth.getUser("apple-no-name-uid")).thenReturn(firebaseUser);
+        when(userRepository.findByFirebaseUid("apple-no-name-uid")).thenReturn(Optional.empty());
+        when(userRepository.findByEmail("myagmb28s@gmail.com")).thenReturn(Optional.empty());
+        when(pendingSocialSignupRepository.findByFirebaseUid("apple-no-name-uid")).thenReturn(Optional.empty());
+        when(pendingSocialSignupRepository.save(any(PendingSocialSignup.class))).thenAnswer(invocation -> {
+            PendingSocialSignup pending = invocation.getArgument(0);
+            pending.setId(UUID.fromString("55555555-5555-5555-5555-555555555555"));
+            return pending;
+        });
+
+        AuthResponse response = authService.loginOrSignUp("apple-token", httpServletRequest);
+
+        assertThat(response.registrationStatus()).isEqualTo("PENDING_ONBOARDING");
+        assertThat(response.nickname()).isEqualTo("장준혁");
     }
 
     @Test
@@ -246,7 +385,7 @@ class AuthServiceTest {
         assertThat(userCaptor.getValue().getRegion()).isEqualTo("경기도 성남시 분당구 삼평동");
         assertThat(userCaptor.getValue().getRegion2DepthName()).isEqualTo("성남시 분당구");
         verify(userPresenceService).touchFromAuthenticationSafely("firebase-uid", null);
-        verify(pendingSocialSignupRepository).delete(pending);
+        verify(pendingSocialSignupRepository).deleteByEmailIgnoreCase("new-user@example.com");
     }
 
     @Test
