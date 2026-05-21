@@ -43,7 +43,7 @@ public class ShelterPetService {
     private final AiSourceCacheService aiSourceCacheService;
     private final NotificationService notificationService;
 
-    private static final String AI_CACHE_NAMESPACE = "shelter-pets";
+    private static final String CACHE_NAMESPACE = "shelter-pets";
 
     @Value("${app.ai-source-cache.ttl-seconds:60}")
     private long aiSourceCacheTtlSeconds;
@@ -51,8 +51,60 @@ public class ShelterPetService {
     public ShelterPetListResponse getShelterPetList(String region, String breed, String status, String sort, int page, int size) {
         int normalizedPage = normalizePage(page);
         int normalizedSize = normalizeSize(size);
+        String effectiveRegion = blankToNull(region);
+        String cacheKey = String.join(":",
+                "public-list",
+                "v" + aiSourceCacheService.currentVersion(CACHE_NAMESPACE),
+                normalizeCacheValue(effectiveRegion),
+                normalizeCacheValue(breed),
+                normalizeCacheValue(status),
+                normalizeCacheValue(sort),
+                String.valueOf(normalizedPage),
+                String.valueOf(normalizedSize)
+        );
+        return aiSourceCacheService.getOrLoad(
+                cacheKey,
+                Duration.ofSeconds(aiSourceCacheTtlSeconds),
+                ShelterPetListResponse.class,
+                () -> getShelterPetListUncached(effectiveRegion, breed, status, sort, normalizedPage, normalizedSize)
+        );
+    }
+
+    private ShelterPetListResponse getShelterPetListUncached(String region, String breed, String status, String sort, int normalizedPage, int normalizedSize) {
+        return getShelterPetListUncached(null, region, breed, status, sort, normalizedPage, normalizedSize);
+    }
+
+    public ShelterPetListResponse searchShelterPets(String query, String region, String breed, String status, String sort, int page, int size) {
+        String normalizedQuery = normalizeTextFilter(query);
+        if (!StringUtils.hasText(normalizedQuery)) {
+            throw com.example.pogun.dto.common.ApiResponse.ApiException.badRequest("MISSING_SEARCH_QUERY", "검색어는 필수입니다.");
+        }
+        int normalizedPage = normalizePage(page);
+        int normalizedSize = normalizeSize(size);
+        String effectiveRegion = blankToNull(region);
+        String cacheKey = String.join(":",
+                "search",
+                "v" + aiSourceCacheService.currentVersion(CACHE_NAMESPACE),
+                normalizeCacheValue(normalizedQuery),
+                normalizeCacheValue(effectiveRegion),
+                normalizeCacheValue(breed),
+                normalizeCacheValue(status),
+                normalizeCacheValue(sort),
+                String.valueOf(normalizedPage),
+                String.valueOf(normalizedSize)
+        );
+        return aiSourceCacheService.getOrLoad(
+                cacheKey,
+                Duration.ofSeconds(aiSourceCacheTtlSeconds),
+                ShelterPetListResponse.class,
+                () -> getShelterPetListUncached(normalizedQuery, effectiveRegion, breed, status, sort, normalizedPage, normalizedSize)
+        );
+    }
+
+    private ShelterPetListResponse getShelterPetListUncached(String query, String region, String breed, String status, String sort, int normalizedPage, int normalizedSize) {
         String requestedRegion = normalizeTextFilter(region);
         String requestedBreed = normalizeTextFilter(breed);
+        String requestedQuery = normalizeTextFilter(query);
         boolean regionCodeFilter = isCodeFilter(requestedRegion);
         boolean breedCodeFilter = isCodeFilter(requestedBreed);
         int apiFetchSize = Math.min(Math.max((normalizedPage + 1) * normalizedSize, normalizedSize), 1000);
@@ -68,6 +120,7 @@ public class ShelterPetService {
                 .filter(item -> matchesStatus(item, status))
                 .filter(item -> matchesRegion(item, requestedRegion, regionCodeFilter))
                 .filter(item -> matchesBreed(item, requestedBreed, breedCodeFilter))
+                .filter(item -> matchesQuery(item, requestedQuery))
                 .toList();
 
         int fromIndex = Math.min(normalizedPage * normalizedSize, filteredItems.size());
@@ -104,7 +157,34 @@ public class ShelterPetService {
         );
     }
 
+    private boolean matchesQuery(ShelterPublicApiClient.ShelterPublicApiAnimal item, String query) {
+        if (!StringUtils.hasText(query)) {
+            return true;
+        }
+        return containsIgnoreCase(buildDefaultTitle(item), query)
+                || containsIgnoreCase(item.specialMark(), query)
+                || containsIgnoreCase(item.happenPlace(), query)
+                || containsIgnoreCase(item.kindName(), query)
+                || containsIgnoreCase(item.kindFullName(), query)
+                || containsIgnoreCase(item.careName(), query)
+                || containsIgnoreCase(item.organizationName(), query);
+    }
+
     public ShelterPetDetailResponse getShelterPetDetail(String id) {
+        String cacheKey = String.join(":",
+                "public-detail",
+                "v" + aiSourceCacheService.currentVersion(CACHE_NAMESPACE),
+                normalizeCacheValue(id)
+        );
+        return aiSourceCacheService.getOrLoad(
+                cacheKey,
+                Duration.ofSeconds(aiSourceCacheTtlSeconds),
+                ShelterPetDetailResponse.class,
+                () -> getShelterPetDetailUncached(id)
+        );
+    }
+
+    private ShelterPetDetailResponse getShelterPetDetailUncached(String id) {
         ShelterPublicApiClient.ShelterPublicApiAnimal external = shelterPublicApiClient.fetchShelterPet(id);
         ShelterPet local = shelterPetRepository.findById(id).orElse(null);
         return new ShelterPetDetailResponse(
@@ -130,36 +210,38 @@ public class ShelterPetService {
 
     public ShelterPetListResponse getAiSourceList(String apiKey, String region, String breed, String status, String sort, int page, int size) {
         aiService.verifyAiApiKey(apiKey);
+        int normalizedPage = normalizePage(page);
+        int normalizedSize = normalizeSize(size);
         String cacheKey = String.join(":",
-            "list",
-            "v" + aiSourceCacheService.currentVersion(AI_CACHE_NAMESPACE),
+            "ai-list",
+            "v" + aiSourceCacheService.currentVersion(CACHE_NAMESPACE),
             normalizeCacheValue(region),
             normalizeCacheValue(breed),
             normalizeCacheValue(status),
             normalizeCacheValue(sort),
-            String.valueOf(page),
-            String.valueOf(size)
+            String.valueOf(normalizedPage),
+            String.valueOf(normalizedSize)
         );
         return aiSourceCacheService.getOrLoad(
             cacheKey,
             Duration.ofSeconds(aiSourceCacheTtlSeconds),
             ShelterPetListResponse.class,
-            () -> getShelterPetList(region, breed, status, sort, page, size)
+            () -> getShelterPetListUncached(region, breed, status, sort, normalizedPage, normalizedSize)
         );
     }
 
     public ShelterPetDetailResponse getAiSourceDetail(String apiKey, String id) {
         aiService.verifyAiApiKey(apiKey);
         String cacheKey = String.join(":",
-            "detail",
-            "v" + aiSourceCacheService.currentVersion(AI_CACHE_NAMESPACE),
+            "ai-detail",
+            "v" + aiSourceCacheService.currentVersion(CACHE_NAMESPACE),
             normalizeCacheValue(id)
         );
         return aiSourceCacheService.getOrLoad(
             cacheKey,
             Duration.ofSeconds(aiSourceCacheTtlSeconds),
             ShelterPetDetailResponse.class,
-            () -> getShelterPetDetail(id)
+            () -> getShelterPetDetailUncached(id)
         );
     }
 
@@ -168,7 +250,7 @@ public class ShelterPetService {
         SimilarNoticeListResponse similar = aiService.getLatestSimilarNotices(response.targetType(), response.targetId());
         List<String> filteredSimilarIds = similar.items().stream().map(item -> item.noticeId()).toList();
         sendSimilarMissingNoticeNotifications(response.analysisId(), id, filteredSimilarIds);
-        aiSourceCacheService.bumpVersion(AI_CACHE_NAMESPACE);
+        aiSourceCacheService.bumpVersion(CACHE_NAMESPACE);
         return response;
     }
 
@@ -308,6 +390,10 @@ public class ShelterPetService {
     }
 
     private String normalizeTextFilter(String value) {
+        return StringUtils.hasText(value) ? value.trim() : null;
+    }
+
+    private String blankToNull(String value) {
         return StringUtils.hasText(value) ? value.trim() : null;
     }
 
