@@ -7,6 +7,7 @@ import com.example.pogun.dto.notification.NotificationDeviceResponse;
 import com.example.pogun.dto.notification.NotificationListResponse;
 import com.example.pogun.dto.notification.NotificationReadAllResponse;
 import com.example.pogun.dto.notification.NotificationResponse;
+import com.example.pogun.dto.notification.NotificationSendRequest;
 import com.example.pogun.dto.notification.NotificationSettingItemRequest;
 import com.example.pogun.dto.notification.NotificationSettingResponse;
 import com.example.pogun.dto.notification.NotificationSettingsUpdateRequest;
@@ -20,6 +21,7 @@ import com.example.pogun.entity.notification.enums.NotificationPriority;
 import com.example.pogun.entity.notification.enums.NotificationTargetType;
 import com.example.pogun.entity.notification.enums.NotificationType;
 import com.example.pogun.entity.user.enums.UserAvailabilityStatus;
+import com.example.pogun.entity.user.enums.UserStatus;
 import com.example.pogun.repository.notification.NotificationRepository;
 import com.example.pogun.repository.notification.UserFcmTokenRepository;
 import com.example.pogun.repository.notification.UserNotificationSettingRepository;
@@ -98,6 +100,217 @@ public class NotificationService {
     public NotificationUnreadCountResponse getUnreadCount() {
         User user = getCurrentUser();
         return new NotificationUnreadCountResponse(notificationRepository.countByUserAndIsReadFalse(user));
+    }
+
+    @Transactional
+    public void createAndSendDirectMessageNotification(
+            User recipient,
+            User sender,
+            UUID roomId,
+            UUID messageId,
+            boolean replyToRecipient,
+            String preview
+    ) {
+        if (recipient == null || sender == null || roomId == null || messageId == null) {
+            return;
+        }
+        if (Objects.equals(recipient.getId(), sender.getId())) {
+            return;
+        }
+
+        NotificationType type = replyToRecipient ? NotificationType.DM_REPLY : NotificationType.DM_MESSAGE;
+        if (!isNotificationEnabled(recipient, type)) {
+            return;
+        }
+
+        User managedRecipient = userRepository.getReferenceById(recipient.getId());
+        User managedSender = userRepository.getReferenceById(sender.getId());
+        String title = replyToRecipient ? "답장이 도착했습니다." : sender.getNickname() + "님의 메시지";
+        String body = trimToNull(preview) != null ? preview : "새 메시지가 도착했습니다.";
+        String dedupKey = "dm-message:" + recipient.getId() + ":" + messageId;
+
+        if (notificationRepository.findByDedupKey(dedupKey).isPresent()) {
+            return;
+        }
+
+        Notification notification = notificationRepository.save(Notification.builder()
+                .user(managedRecipient)
+                .actorUser(managedSender)
+                .type(type)
+                .targetType(NotificationTargetType.NOTICE_CHAT_MESSAGE)
+                .targetId(messageId)
+                .title(title)
+                .body(body)
+                .priority(NotificationPriority.HIGH)
+                .dedupKey(dedupKey)
+                .metadata(Map.of(
+                        "roomId", roomId.toString(),
+                        "senderUserId", sender.getId().toString()
+                ))
+                .build());
+
+        UserPresenceService.PresenceSnapshot snapshot = userPresenceService.snapshot(managedRecipient);
+        if (snapshot.availabilityStatus() == UserAvailabilityStatus.IDLE) {
+            return;
+        }
+        if ("connected".equalsIgnoreCase(snapshot.actualConnectionState())) {
+            return;
+        }
+
+        List<UserFcmToken> activeTokens = userFcmTokenRepository.findByUserAndActiveTrueOrderByUpdatedAtDesc(managedRecipient);
+        for (UserFcmToken fcmToken : activeTokens) {
+            try {
+                Message.Builder builder = Message.builder()
+                        .setToken(fcmToken.getToken())
+                        .putData("notificationId", notification.getId().toString())
+                        .putData("type", type.name())
+                        .putData("targetType", NotificationTargetType.NOTICE_CHAT_MESSAGE.name())
+                        .putData("targetId", messageId.toString())
+                        .putData("title", title)
+                        .putData("body", body)
+                        .putData("priority", NotificationPriority.HIGH.name())
+                        .putData("roomId", roomId.toString())
+                        .putData("senderUserId", sender.getId().toString());
+                firebaseMessaging.send(builder.build());
+            } catch (Exception e) {
+                log.warn("FCM 발송 실패. tokenId={}, reason={}", fcmToken.getId(), e.getMessage());
+                if (e instanceof FirebaseMessagingException firebaseMessagingException && isUnregisteredToken(firebaseMessagingException)) {
+                    fcmToken.setActive(false);
+                    userFcmTokenRepository.save(fcmToken);
+                }
+            }
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public NotificationResponse getNotification(String notificationId) {
+        User user = getCurrentUser();
+        Notification notification = getOwnedNotification(user, notificationId);
+        return toNotificationResponse(notification);
+    }
+
+    @Transactional
+    public Map<String, Object> sendNotification(NotificationSendRequest request) {
+        String target = trimToNull(request == null ? null : request.getTarget());
+        if (target == null) {
+            throw ApiException.badRequest("MISSING_NOTIFICATION_TARGET", "알림 대상은 필수입니다.");
+        }
+        return switch (target.toLowerCase()) {
+            case "all" -> sendNotificationToAllUsers(request);
+            case "specific" -> {
+                if (request.getUserIds() == null || request.getUserIds().isEmpty()) {
+                    throw ApiException.badRequest("MISSING_NOTIFICATION_USERS", "specific 발송에는 userIds가 필요합니다.");
+                }
+                yield sendNotificationToSpecificUsers(request);
+            }
+            default -> throw ApiException.badRequest("INVALID_NOTIFICATION_TARGET", "지원하지 않는 알림 대상입니다.");
+        };
+    }
+
+    private Map<String, Object> sendNotificationToSpecificUsers(NotificationSendRequest request) {
+        User sender = getCurrentUser();
+        int deliveredCount = 0;
+        int skippedCount = 0;
+        int failedCount = 0;
+        int failedTokenCount = 0;
+        List<User> recipients = request.getUserIds().stream()
+                .map(userId -> {
+                    UUID recipientId = parseUuid(userId, "INVALID_USER_ID", "올바르지 않은 사용자 ID 형식입니다.");
+                    return userRepository.findById(recipientId)
+                            .orElseThrow(() -> ApiException.notFound("USER_NOT_FOUND", "사용자를 찾을 수 없습니다."));
+                })
+                .distinct()
+                .toList();
+        for (User recipient : recipients) {
+            try {
+                Map<String, Object> result = sendNotificationToUser(sender, recipient, request);
+                int sentCount = ((Number) result.getOrDefault("sentCount", 0)).intValue();
+                failedTokenCount += ((Number) result.getOrDefault("failedTokenCount", 0)).intValue();
+                if (sentCount > 0) {
+                    deliveredCount++;
+                } else {
+                    skippedCount++;
+                }
+            } catch (RuntimeException e) {
+                failedCount++;
+                log.warn("user specific notification failed. senderId={}, recipientId={}, reason={}",
+                        sender.getId(),
+                        recipient.getId(),
+                        e.getMessage());
+            }
+        }
+        return Map.of(
+                "target", "specific",
+                "targetCount", recipients.size(),
+                "deliveredCount", deliveredCount,
+                "skippedCount", skippedCount,
+                "failedCount", failedCount,
+                "failedTokenCount", failedTokenCount
+        );
+    }
+
+    private Map<String, Object> sendNotificationToUser(User sender, User recipient, NotificationSendRequest request) {
+        return createAndSendNotification(
+                recipient,
+                sender,
+                NotificationType.USER_DIRECT,
+                NotificationTargetType.USER,
+                recipient.getId(),
+                request.getTitle(),
+                request.getBody(),
+                NotificationPriority.NORMAL,
+                null,
+                Map.of("senderUserId", sender.getId().toString())
+        );
+    }
+
+    private Map<String, Object> sendNotificationToAllUsers(NotificationSendRequest request) {
+        User sender = getCurrentUser();
+        List<User> recipients = userRepository.findAll().stream()
+                .filter(user -> user.getStatus() == UserStatus.ACTIVE)
+                .filter(user -> !Objects.equals(user.getId(), sender.getId()))
+                .toList();
+        int deliveredCount = 0;
+        int skippedCount = 0;
+        int failedCount = 0;
+        int failedTokenCount = 0;
+        for (User recipient : recipients) {
+            try {
+                Map<String, Object> result = createAndSendNotification(
+                        recipient,
+                        sender,
+                        NotificationType.USER_BROADCAST,
+                        NotificationTargetType.USER,
+                        recipient.getId(),
+                        request.getTitle(),
+                        request.getBody(),
+                        NotificationPriority.NORMAL,
+                        null,
+                        Map.of("senderUserId", sender.getId().toString())
+                );
+                int sentCount = ((Number) result.getOrDefault("sentCount", 0)).intValue();
+                failedTokenCount += ((Number) result.getOrDefault("failedTokenCount", 0)).intValue();
+                if (sentCount > 0) {
+                    deliveredCount++;
+                } else {
+                    skippedCount++;
+                }
+            } catch (RuntimeException e) {
+                failedCount++;
+                log.warn("user broadcast notification failed. senderId={}, recipientId={}, reason={}",
+                        sender.getId(),
+                        recipient.getId(),
+                        e.getMessage());
+            }
+        }
+        return Map.of(
+                "target", request.getTarget(),
+                "targetCount", recipients.size(),
+                "deliveredCount", deliveredCount,
+                "skippedCount", skippedCount,
+                "failedCount", failedCount,
+                "failedTokenCount", failedTokenCount
+        );
     }
 
     @Transactional
@@ -442,6 +655,14 @@ public class NotificationService {
             return NotificationType.valueOf(trimToNull(type).toUpperCase());
         } catch (IllegalArgumentException | NullPointerException e) {
             throw ApiException.badRequest("INVALID_NOTIFICATION_TYPE", "올바르지 않은 알림 타입입니다.");
+        }
+    }
+
+    private UUID parseUuid(String value, String code, String message) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw ApiException.badRequest(code, message);
         }
     }
 

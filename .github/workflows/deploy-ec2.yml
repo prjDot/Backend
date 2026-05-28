@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: deploy-ec2-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   IMAGE_NAME: pawgun
 
@@ -17,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     outputs:
-      image_ref: ${{ steps.pushed-image.outputs.image_ref }}
+      image_tag: ${{ steps.image-tag.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -27,13 +31,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/dev' }}
 
       - name: Build and test
-        run: ./gradlew test bootJar --no-daemon --build-cache
+        run: ./gradlew test bootJar --build-cache --parallel
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -46,7 +51,10 @@ jobs:
 
       - name: Set image tag
         id: image-tag
-        run: echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=sha-${short_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         id: build-push
@@ -55,20 +63,149 @@ jobs:
           context: .
           push: true
           tags: |
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:sha-${{ steps.image-tag.outputs.short_sha }}
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.image_tag }}
           cache-from: type=gha
-          cache-to: type=gha,mode=min
+          cache-to: type=gha,mode=min,ignore-error=true
           provenance: false
           sbom: false
 
-      - name: Set pushed image ref
-        id: pushed-image
+      - name: Delete old Docker Hub sha tags
+        if: github.ref == 'refs/heads/dev'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          PUSHED_DIGEST: ${{ steps.build-push.outputs.digest }}
-        run: echo "image_ref=docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}@${PUSHED_DIGEST}" >> "$GITHUB_OUTPUT"
+          KEEP_TAG: ${{ steps.image-tag.outputs.image_tag }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import base64
+          import urllib.parse
+          import urllib.error
+          import urllib.request
+
+          username = os.environ["DOCKERHUB_USERNAME"]
+          secret = os.environ["DOCKERHUB_TOKEN"]
+          repository = os.environ["IMAGE_NAME"]
+          keep_tag = os.environ["KEEP_TAG"]
+
+          auth_body = json.dumps({
+              "identifier": username,
+              "secret": secret,
+          }).encode("utf-8")
+
+          auth_request = urllib.request.Request(
+              "https://hub.docker.com/v2/auth/token",
+              data=auth_body,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+
+          with urllib.request.urlopen(auth_request) as response:
+              access_token = json.load(response)["access_token"]
+
+          auth_headers = {"Authorization": f"Bearer {access_token}"}
+          tag_pattern = re.compile(r"sha-[0-9a-f]{12}")
+          delete_targets = []
+          digests_to_delete = set()
+          next_url = f"https://hub.docker.com/v2/namespaces/{username}/repositories/{repository}/tags?page_size=100"
+
+          def collect_candidate_digests(tag_result):
+              digests = set()
+              top_level_digest = tag_result.get("digest")
+              if top_level_digest:
+                  digests.add(top_level_digest)
+              images = tag_result.get("images") or []
+              if isinstance(images, dict):
+                  images = [images]
+              for image in images:
+                  digest = image.get("digest")
+                  if digest:
+                      digests.add(digest)
+              return digests
+
+          while next_url:
+              request = urllib.request.Request(next_url, headers=auth_headers, method="GET")
+              with urllib.request.urlopen(request) as response:
+                  payload = json.load(response)
+              for result in payload.get("results", []):
+                  tag_name = result.get("name", "")
+                  if tag_pattern.fullmatch(tag_name) and tag_name != keep_tag:
+                      delete_targets.append(tag_name)
+                      digests_to_delete.update(collect_candidate_digests(result))
+              next_url = payload.get("next")
+
+          if not delete_targets:
+              print(f"No old Docker Hub sha tags to delete. keep_tag={keep_tag}")
+              sys.exit(0)
+
+          deleted_count = 0
+          for tag_name in delete_targets:
+              delete_request = urllib.request.Request(
+                  f"https://hub.docker.com/v2/namespaces/{username}/repositories/{repository}/tags/{tag_name}",
+                  headers=auth_headers,
+                  method="DELETE",
+              )
+              try:
+                  with urllib.request.urlopen(delete_request):
+                      deleted_count += 1
+                      print(f"Deleted Docker Hub tag: {tag_name}")
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      print(f"Skip missing Docker Hub tag: {tag_name}")
+                      continue
+                  raise
+
+          registry_scope = f"repository:{username}/{repository}:pull,delete"
+          registry_token_url = "https://auth.docker.io/token?" + urllib.parse.urlencode({
+              "service": "registry.docker.io",
+              "scope": registry_scope,
+          })
+          basic_auth = base64.b64encode(f"{username}:{secret}".encode("utf-8")).decode("ascii")
+          registry_token_request = urllib.request.Request(
+              registry_token_url,
+              headers={"Authorization": f"Basic {basic_auth}"},
+              method="GET",
+          )
+          with urllib.request.urlopen(registry_token_request) as response:
+              registry_token_payload = json.load(response)
+          registry_token = registry_token_payload.get("token") or registry_token_payload.get("access_token")
+          registry_headers = {
+              "Authorization": f"Bearer {registry_token}",
+              "Accept": ",".join([
+                  "application/vnd.oci.image.index.v1+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              ]),
+          }
+
+          deleted_manifest_count = 0
+          for digest in sorted(digests_to_delete):
+              manifest_request = urllib.request.Request(
+                  f"https://registry-1.docker.io/v2/{username}/{repository}/manifests/{digest}",
+                  headers=registry_headers,
+                  method="DELETE",
+              )
+              try:
+                  with urllib.request.urlopen(manifest_request) as response:
+                      if response.status in (202, 200):
+                          deleted_manifest_count += 1
+                          print(f"Deleted Docker Hub manifest: {digest}")
+              except urllib.error.HTTPError as error:
+                  if error.code in (404, 405):
+                      print(f"Skip manifest delete for digest={digest} code={error.code}")
+                      continue
+                  raise
+
+          print(
+              "Docker Hub cleanup complete. "
+              f"deleted_tags={deleted_count} deleted_manifests={deleted_manifest_count} keep_tag={keep_tag}"
+          )
+          PY
 
   deploy:
     runs-on: ubuntu-latest
@@ -93,6 +230,9 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o IdentitiesOnly=yes \
             -o NumberOfPasswordPrompts=1 \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
             -i ~/.ssh/pawgun_ec2_key \
             -p "${{ secrets.EC2_PORT || 22 }}" \
             "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
@@ -104,28 +244,34 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o IdentitiesOnly=yes \
             -o NumberOfPasswordPrompts=1 \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=2 \
             -i ~/.ssh/pawgun_ec2_key \
             -p "${{ secrets.EC2_PORT || 22 }}" \
-            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" <<EOF
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" <<'EOF'
           set -e
           APP_DIR="${{ secrets.EC2_APP_DIR }}"
-          mkdir -p "\$APP_DIR"
-          cd "\$APP_DIR"
+          mkdir -p "$APP_DIR"
+          cd "$APP_DIR"
 
           if ! command -v docker >/dev/null 2>&1; then
             sudo dnf install -y docker
           fi
-          sudo systemctl enable --now docker
+          if ! sudo systemctl is-active --quiet docker; then
+            sudo systemctl start docker
+          fi
+          sudo systemctl enable docker >/dev/null 2>&1 || true
 
           if ! sudo docker compose version >/dev/null 2>&1; then
-            arch="\$(uname -m)"
-            case "\$arch" in
+            arch="$(uname -m)"
+            case "$arch" in
               x86_64) compose_arch="x86_64" ;;
               aarch64) compose_arch="aarch64" ;;
-              *) echo "Unsupported architecture for Docker Compose: \$arch"; exit 1 ;;
+              *) echo "Unsupported architecture for Docker Compose: $arch"; exit 1 ;;
             esac
             sudo mkdir -p /usr/local/lib/docker/cli-plugins
-            sudo curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-\$compose_arch" \
+            sudo curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-$compose_arch" \
               -o /usr/local/lib/docker/cli-plugins/docker-compose
             sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
             sudo docker compose version
@@ -135,12 +281,22 @@ jobs:
           cat > .env <<'ENVEOF'
           SPRING_PROFILES_ACTIVE=prod
           PORT=${{ secrets.PORT }}
-          APP_IMAGE=${{ needs.build-and-push.outputs.image_ref }}
+          APP_IMAGE=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}
           APP_STARTUP_WARMUP_ENABLED=true
           APP_SCHEMA_SYNC_ENABLED=true
+          APP_PRESENCE_RECONCILE_INTERVAL_MS=1500
+          APP_NOTIFICATION_INACTIVE_TOKEN_RETENTION_DAYS=30
+          APP_NOTIFICATION_INACTIVE_TOKEN_CLEANUP_CRON=0 10 4 * * *
+          APP_ADMIN_SESSION_TTL_SECONDS=28800
+          APP_ADMIN_BOOTSTRAP_SESSION_TTL_SECONDS=900
+          APP_ADMIN_CHALLENGE_TTL_SECONDS=300
+          APP_FIREBASE_AUTH_MODE=PRODUCTION
+          APP_FIREBASE_AUTH_ALLOW_EMULATOR=false
+          APP_FIREBASE_AUTH_EMULATOR_PROJECT_ID=
           JAVA_STARTUP_OPTS=-XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+TieredCompilation -XX:TieredStopAtLevel=1 -Djava.security.egd=file:/dev/./urandom
           AI_API_KEY=${{ secrets.AI_API_KEY }}
           APP_ADMIN_WEBAUTHN_ALLOWED_ORIGINS=${{ secrets.APP_ADMIN_WEBAUTHN_ALLOWED_ORIGINS }}
+          APP_ADMIN_WEBAUTHN_ORIGIN_RP_MAP=${{ secrets.APP_ADMIN_WEBAUTHN_ORIGIN_RP_MAP }}
           APP_ADMIN_WEBAUTHN_RP_ID=${{ secrets.APP_ADMIN_WEBAUTHN_RP_ID }}
           APP_ADMIN_WEBAUTHN_RP_NAME=${{ secrets.APP_ADMIN_WEBAUTHN_RP_NAME }}
           AWS_REGION=${{ secrets.AWS_REGION }}
@@ -151,12 +307,6 @@ jobs:
           FIREBASE_KEY_BASE64=${{ secrets.FIREBASE_KEY_BASE64 }}
           FIREBASE_PROJECT_ID=${{ secrets.FIREBASE_PROJECT_ID }}
           FIREBASE_WEB_API_KEY=${{ secrets.FIREBASE_WEB_API_KEY }}
-          FIREBASE_WEB_APP_ID=${{ secrets.FIREBASE_WEB_APP_ID }}
-          FIREBASE_WEB_AUTH_DOMAIN=${{ secrets.FIREBASE_WEB_AUTH_DOMAIN }}
-          FIREBASE_WEB_MESSAGING_SENDER_ID=${{ secrets.FIREBASE_WEB_MESSAGING_SENDER_ID }}
-          FIREBASE_WEB_PROJECT_ID=${{ secrets.FIREBASE_WEB_PROJECT_ID }}
-          FIREBASE_WEB_STORAGE_BUCKET=${{ secrets.FIREBASE_WEB_STORAGE_BUCKET }}
-          FIREBASE_WEB_VAPID_KEY=${{ secrets.FIREBASE_WEB_VAPID_KEY }}
           GCLOUD_PROJECT=${{ secrets.GCLOUD_PROJECT }}
           KAKAO_JAVASCRIPT_KEY=${{ secrets.KAKAO_JAVASCRIPT_KEY }}
           KAKAO_LOCAL_BASE_URL=${{ secrets.KAKAO_LOCAL_BASE_URL }}
@@ -167,38 +317,47 @@ jobs:
           SHELTER_API_SERVICE_KEY=${{ secrets.SHELTER_API_SERVICE_KEY }}
           ENVEOF
 
+          sed -i '/^DB_PASSWORD=/ s/\$/$$/g' .env
+
+          compose() {
+            sudo docker compose --env-file "$APP_DIR/.env" -f "$APP_DIR/docker-compose.yml" "$@"
+          }
+
           # docker-compose.yml reads .env, then pulls the tagged app image and starts app + redis
           echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-          sudo docker compose pull --quiet app
-          sudo docker compose up -d --remove-orphans redis
-          sudo docker compose up -d --remove-orphans --no-deps app
-          sudo docker compose ps
+          compose pull --quiet app
+          redis_state="$(sudo docker inspect -f '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' pogun-redis 2>/dev/null || true)"
+          if ! echo "$redis_state" | grep -q '^true healthy'; then
+            compose up -d --remove-orphans redis
+          fi
+          compose up -d --remove-orphans --no-deps app
+          compose ps
 
-          health_port="\$(grep -E '^PORT=' .env | cut -d= -f2-)"
-          health_port="\${health_port:-8080}"
-          health_url="http://127.0.0.1:\${health_port}/health"
+          health_port="$(grep -E '^PORT=' .env | cut -d= -f2-)"
+          health_port="${health_port:-8080}"
+          health_url="http://127.0.0.1:${health_port}/health"
           for attempt in {1..60}; do
-            if curl -fsS "\$health_url" >/dev/null 2>&1; then
-              echo "Application health endpoint passed: \$health_url"
+            if curl -fsS "$health_url" >/dev/null 2>&1; then
+              echo "Application health endpoint passed: $health_url"
               break
             fi
 
-            app_status="\$(sudo docker inspect -f '{{.State.Status}}' pogun-backend)"
-            app_health="\$(sudo docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' pogun-backend)"
+            app_status="$(sudo docker inspect -f '{{.State.Status}}' pogun-backend)"
+            app_health="$(sudo docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' pogun-backend)"
 
-            if [ "\$app_status" = "exited" ] || [ "\$app_status" = "dead" ]; then
-              sudo docker compose logs --tail=200 app
+            if [ "$app_status" = "exited" ] || [ "$app_status" = "dead" ]; then
+              compose logs --tail=200 app
               exit 1
             fi
 
-            if [ "\$attempt" -eq 60 ]; then
-              sudo docker compose logs --tail=200 app
+            if [ "$attempt" -eq 60 ]; then
+              compose logs --tail=200 app
               exit 1
             fi
 
-            echo "Waiting for app healthcheck... status=\$app_status health=\$app_health attempt=\$attempt/60"
+            echo "Waiting for app healthcheck... status=$app_status health=$app_health attempt=$attempt/60"
             sleep 2
           done
 
-          sudo docker image prune -f
+          echo "Deploy completed. Skipping docker image prune in hot deploy path."
           EOF
