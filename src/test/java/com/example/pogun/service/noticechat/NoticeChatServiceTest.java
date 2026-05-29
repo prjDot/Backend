@@ -3,6 +3,7 @@ package com.example.pogun.service.noticechat;
 import com.example.pogun.dto.common.ApiResponse.ApiException;
 import com.example.pogun.dto.noticechat.NoticeChatMessageRequest;
 import com.example.pogun.dto.noticechat.NoticeChatMessageUpdateRequest;
+import com.example.pogun.dto.noticechat.NoticeChatRoomEventRequest;
 import com.example.pogun.dto.storage.StoredImageVariant;
 import com.example.pogun.entity.missingpet.PetNotice;
 import com.example.pogun.entity.missingpet.enums.PetGender;
@@ -108,6 +109,10 @@ class NoticeChatServiceTest {
         );
         lenient().when(participantStateRepository.findByRoomAndUser(any(NoticeChatRoom.class), any(User.class)))
                 .thenAnswer(invocation -> Optional.of(participantState(invocation.getArgument(0), invocation.getArgument(1))));
+        lenient().when(participantStateRepository.findByRoomAndUserForUpdate(any(NoticeChatRoom.class), any(User.class)))
+                .thenAnswer(invocation -> Optional.of(participantState(invocation.getArgument(0), invocation.getArgument(1))));
+        lenient().when(noticeChatReadReceiptRepository.findByRoomAndReaderForUpdate(any(NoticeChatRoom.class), any(User.class)))
+                .thenReturn(Optional.empty());
         lenient().when(userPresenceService.snapshot(any(User.class))).thenAnswer(invocation -> {
             User user = invocation.getArgument(0);
             return new UserPresenceService.PresenceSnapshot(
@@ -644,7 +649,7 @@ class NoticeChatServiceTest {
         when(userRepository.findByFirebaseUid(currentUser.getFirebaseUid())).thenReturn(Optional.of(currentUser));
         when(noticeChatRoomRepository.findById(roomId)).thenReturn(Optional.of(room));
         when(noticeChatMessageRepository.findVisiblePage(eq(room), eq(null), eq(PageRequest.of(0, 51)))).thenReturn(List.of(unread));
-        when(noticeChatReadReceiptRepository.findByRoomAndReader(room, currentUser)).thenReturn(Optional.empty());
+        when(noticeChatReadReceiptRepository.findByRoomAndReaderForUpdate(room, currentUser)).thenReturn(Optional.empty());
 
         var response = noticeChatService.getMessages(roomId.toString(), null, null);
 
@@ -673,13 +678,42 @@ class NoticeChatServiceTest {
         when(userRepository.findByFirebaseUid(currentUser.getFirebaseUid())).thenReturn(Optional.of(currentUser));
         when(noticeChatRoomRepository.findById(roomId)).thenReturn(Optional.of(room));
         when(noticeChatMessageRepository.findVisiblePage(eq(room), eq(null), eq(PageRequest.of(0, 51)))).thenReturn(List.of(message));
-        when(noticeChatReadReceiptRepository.findByRoomAndReader(room, currentUser)).thenReturn(Optional.empty());
+        when(noticeChatReadReceiptRepository.findByRoomAndReaderForUpdate(room, currentUser)).thenReturn(Optional.empty());
 
         var response = noticeChatService.getMessages(roomId.toString(), null, null);
 
         assertThat(response.messages()).hasSize(1);
         assertThat(response.messages().get(0).senderProfileImageUrl())
                 .isEqualTo("https://cdn.example.com/profile/author.webp");
+    }
+
+    @Test
+    void enterRoom_usesLatestOpponentMessageWithoutHundredMessageScan() {
+        UUID roomId = UUID.randomUUID();
+        NoticeChatRoom room = room(roomId, openNotice, author, currentUser);
+        NoticeChatMessage latestOpponentMessage = NoticeChatMessage.builder()
+                .id(UUID.randomUUID())
+                .room(room)
+                .senderUser(author)
+                .messageType(NoticeChatMessageType.TEXT)
+                .message("가장 최근 상대 메시지")
+                .roomSequence(301L)
+                .createdAt(Instant.now())
+                .build();
+        NoticeChatRoomEventRequest request = new NoticeChatRoomEventRequest();
+        request.setRoomId(roomId);
+
+        when(userRepository.findByFirebaseUid(currentUser.getFirebaseUid())).thenReturn(Optional.of(currentUser));
+        when(noticeChatRoomRepository.findById(roomId)).thenReturn(Optional.of(room));
+        when(noticeChatMessageRepository.findTopByRoomAndSenderUserNotAndDeletedAtIsNullOrderByRoomSequenceDescCreatedAtDesc(room, currentUser))
+                .thenReturn(Optional.of(latestOpponentMessage));
+        when(noticeChatReadReceiptRepository.findByRoomAndReaderForUpdate(room, currentUser)).thenReturn(Optional.empty());
+
+        var response = noticeChatService.enterRoom(principal(currentUser), request);
+
+        assertThat(response.roomId()).isEqualTo(roomId);
+        verify(noticeChatMessageRepository)
+                .findTopByRoomAndSenderUserNotAndDeletedAtIsNullOrderByRoomSequenceDescCreatedAtDesc(room, currentUser);
     }
 
     @Test
